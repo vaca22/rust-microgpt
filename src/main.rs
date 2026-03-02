@@ -1,308 +1,192 @@
 // -----------------------------
 // Rust translation of Andrej Karpathy's microgpt
 // https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95#file-microgpt-py
+// 
 // -----------------------------
+pub mod mt19937_rng;
+pub mod tape;
+pub mod model;
 
-mod autograd_value;
-mod model_utils;
-mod simple_rng;
+use crate::mt19937_rng::PythonRandom;
+use crate::tape::*;
+use crate::model::*;
 
-use crate::autograd_value::*;
-use crate::simple_rng::Rng;
-use crate::model_utils::*;
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
-use std::f64;
-use std::fs;
+const NUM_STEPS: usize = 1000;
 
-fn gpt(
-    t: &mut Tape,
-    token_id: usize,
-    pos_id: usize,
-    keys: &mut Vec<Vec<Vec<V>>>,
-    values: &mut Vec<Vec<Vec<V>>>,
-    wte: &Vec<Vec<V>>,
-    wpe: &Vec<Vec<V>>,
-    lm_head: &Vec<Vec<V>>,
-    attn_wq: &Vec<Vec<V>>,
-    attn_wk: &Vec<Vec<V>>,
-    attn_wv: &Vec<Vec<V>>,
-    attn_wo: &Vec<Vec<V>>,
-    mlp_fc1: &Vec<Vec<V>>,
-    mlp_fc2: &Vec<Vec<V>>,
-    n_head: usize,
-    head_dim: usize,
-) -> Vec<V> {
-    // Token + position embedding
-    let tok_emb = &wte[token_id];
-    let pos_emb = &wpe[pos_id];
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize Tape and Random Number Generator
+    let mut rng = PythonRandom::new(42);
+    let mut tape = Tape::new(
+        MAX_VOCAB_SIZE * N_EMBD * 3
+            + N_LAYER * (4 * N_EMBD * N_EMBD + 4 * N_EMBD * N_EMBD),
+    );
 
-    let x_emb: Vec<V> = tok_emb.iter().zip(pos_emb)
-        .map(|(&tk, &ps)| add(t, tk, ps))
-        .collect();
-
-    let mut x = rmsnorm(t, &x_emb);
-
-    // --- Multi-head attention ---
-    let x_residual_attn = x.clone();
-    let x_norm = rmsnorm(t, &x);
-
-    let q = linear(t, &x_norm, attn_wq);
-    let k = linear(t, &x_norm, attn_wk);
-    let v = linear(t, &x_norm, attn_wv);
-
-    keys[0].push(k.clone());
-    values[0].push(v.clone());
-
-    let mut x_attn: Vec<V> = vec![];
-    let scale = 1.0 / (head_dim as f64).sqrt();
-
-    for h in 0..n_head {
-        let hs = h * head_dim;
-        let q_h = &q[hs..hs + head_dim];
-        let mut attn_logits: Vec<V> = vec![];
-
-        for time_step in 0..keys[0].len() {
-            let k_h = &keys[0][time_step][hs..hs + head_dim];
-            let mut dot = t.val(0.0);
-            for j in 0..head_dim {
-                let prod = mul(t, q_h[j], k_h[j]);
-                dot = add(t, dot, prod);
-            }
-            attn_logits.push(mul_const(t, dot, scale));
-        }
-
-        let attn_weights = softmax(t, &attn_logits);
-
-        for j in 0..head_dim {
-            let mut sum = t.val(0.0);
-            for time_step in 0..values[0].len() {
-                let term = mul(t, attn_weights[time_step], values[0][time_step][hs + j]);
-                sum = add(t, sum, term);
-            }
-            x_attn.push(sum);
-        }
-    }
-
-    x = linear(t, &x_attn, attn_wo);
-
-    x = x.iter().zip(&x_residual_attn).map(|(&a, &b)| add(t, a, b)).collect();
-
-    // --- MLP block ---
-    let x_residual_mlp = x.clone();
-    let x_norm_mlp = rmsnorm(t, &x);
-    let mut x_mlp = linear(t, &x_norm_mlp, mlp_fc1);
-    x_mlp = x_mlp.into_iter().map(|xi| relu(t, xi)).collect();
-    x_mlp = linear(t, &x_mlp, mlp_fc2);
-
-    x = x_mlp.iter().zip(&x_residual_mlp).map(|(&a, &b)| add(t, a, b)).collect();
-
-    linear(t, &x, lm_head)
-}
-
-fn main() {
-    let mut rng = Rng::new(42);
-
-    let contents = fs::read_to_string("input.txt")
-        .expect("failed to read input.txt");
-
-    let mut docs: Vec<String> = contents
+    // 2. Load and Shuffle Documents
+    let file = File::open("input.txt")?;
+    let reader = BufReader::new(file);
+    let mut docs: Vec<String> = reader
         .lines()
-        .map(|l| l.trim())
+        .filter_map(|l| l.ok())
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
         .collect();
 
-    println!("num docs: {}", docs.len());
+    rng.shuffle(&mut docs);
+    println!("Num docs: {}", docs.len());
 
-    // Shuffle
-    for i in (1..docs.len()).rev() {
-        let j = (rng.uniform() * (i as f64 + 1.0)) as usize;
-        docs.swap(i, j);
-    }
-
-    let mut uchars: Vec<char> = docs.iter().flat_map(|d| d.chars()).collect();
-    uchars.sort_unstable();
-    uchars.dedup();
-
-    let bos = uchars.len();
-    let vocab_size = uchars.len() + 1;
-    println!("vocab size: {}", vocab_size);
-
-    // Hyperparameters
-    let n_embd = 16;
-    let n_layer = 1;
-    let n_head = 4;
-    let head_dim = n_embd / n_head;
-    let block_size = 16;
-
-    let mut tape = Tape::new();
-
-    // Matrix helper for Tape
-    let mut matrix = |t: &mut Tape, nout: usize, nin: usize| -> Vec<Vec<V>> {
-        (0..nout).map(|_| (0..nin).map(|_| t.val(rng.gauss(0.0, 0.02))).collect()).collect()
-    };
-
-    // Initialize Weight Parameters (These stay on the tape at indices 0..N)
-    let wte = matrix(&mut tape, vocab_size, n_embd);
-    let wpe = matrix(&mut tape, block_size, n_embd);
-    let lm_head = matrix(&mut tape, vocab_size, n_embd);
-    let attn_wq = matrix(&mut tape, n_embd, n_embd);
-    let attn_wk = matrix(&mut tape, n_embd, n_embd);
-    let attn_wv = matrix(&mut tape, n_embd, n_embd);
-    let attn_wo = matrix(&mut tape, n_embd, n_embd);
-    let mlp_fc1 = matrix(&mut tape, 4 * n_embd, n_embd);
-    let mlp_fc2 = matrix(&mut tape, n_embd, 4 * n_embd);
-
-    let mut params: Vec<V> = vec![];
-    for mat in [
-        &wte, &wpe, &lm_head,
-        &attn_wq, &attn_wk, &attn_wv, &attn_wo,
-        &mlp_fc1, &mlp_fc2,
-    ] {
-        for row in mat {
-            for p in row {
-                params.push(p.clone());
-            }
+    // 3. Build Vocabulary
+    let mut uchars = BTreeSet::new();
+    for doc in &docs {
+        for c in doc.chars() {
+            uchars.insert(c);
         }
     }
 
-    let num_params = params.len();
-    println!("num params: {}", num_params);
-    // Adam buffers
-    let mut m = vec![0.0; num_params];
-    let mut v = vec![0.0; num_params];
+    let bos_idx = uchars.len();
+    let vocab_size = uchars.len() + 1;
+    println!("Vocab size: {}", vocab_size);
 
-    // Save the "Watermark" index where weights end and computation begins
-    let weights_end_idx = tape.node_count();
+    if vocab_size > MAX_VOCAB_SIZE {
+        panic!("vocab_size ({}) exceeds MAX_VOCAB_SIZE", vocab_size);
+    }
+
+    let idx_to_char: Vec<char> = uchars.iter().cloned().collect();
+
+    // Map char to index (for training/tokenization)
+    // Using a HashMap or BTreeMap handles Unicode range (0 to 0x10FFFF)
+    let mut char_to_idx = std::collections::HashMap::new();
+    for (idx, &c) in uchars.iter().enumerate() {
+        char_to_idx.insert(c, idx);
+    }
+
+    // 4. Initialize Model and Optimizer State
+    let state_dict = Model::new(&mut tape, &mut rng, vocab_size, N_EMBD, BLOCK_SIZE, N_LAYER);
+    let weights_end = tape.len();
+    println!("Num params: {}", weights_end);
 
     let learning_rate = 0.01;
-    let beta1 = 0.85;
-    let beta2 = 0.99;
-    let eps = 1e-8;
-    let num_steps = 1000;
+    let beta1: f32 = 0.85;
+    let beta2: f32 = 0.99;
+    let eps_adam = 1e-8;
 
-    for step in 0..num_steps {
+    let mut m = vec![0.0; weights_end];
+    let mut v = vec![0.0; weights_end];
+
+    // 5. Training Loop
+    for step in 0..NUM_STEPS {
         let doc = &docs[step % docs.len()];
-        let mut tokens = vec![bos];
+        
+        // Tokenizer: BOS + doc characters + BOS
+        let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
+        tokens.push(bos_idx);
         for ch in doc.chars() {
-            tokens.push(uchars.iter().position(|c| *c == ch).unwrap());
+            // .get() returns an Option, protecting against chars not in training set
+            if let Some(&idx) = char_to_idx.get(&ch) {
+                tokens.push(idx);
+            }
         }
-        tokens.push(bos);
+        tokens.push(bos_idx);
 
-        let mut keys: Vec<Vec<Vec<V>>> = vec![vec![]; n_layer];
-        let mut values: Vec<Vec<Vec<V>>> = vec![vec![]; n_layer];
+        let n = (tokens.len() - 1).min(BLOCK_SIZE);
 
-        let mut losses = vec![];
+        // Forward Pass
+        let mut keys: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+        let mut values: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+        let mut losses = [0usize; BLOCK_SIZE];
 
-        for pos in 0..tokens.len() - 1 {
-            let logits = gpt(&mut tape, tokens[pos], pos, &mut keys, &mut values,
-                             &wte, &wpe, &lm_head, &attn_wq, &attn_wk, &attn_wv,
-                             &attn_wo, &mlp_fc1, &mlp_fc2, n_head, head_dim);
-            let probs = softmax(&mut tape, &logits);
-            let target_id = tokens[pos + 1];
-            let prob_val = probs[target_id];
-
-            let log_val = log(&mut tape, prob_val); // First borrow ends here
-            let loss_t = neg(&mut tape, log_val);    // Second borrow starts here
-
-            losses.push(loss_t);
-        }
-
-        let mut sum_loss_idx = tape.val(0.0);
-        for l_idx in losses {
-            sum_loss_idx = add(&mut tape, sum_loss_idx, l_idx);
-        }
-        let n_val = tape.val((tokens.len() - 1) as f64);
-        let total_loss_idx = div(&mut tape, sum_loss_idx, n_val);
-
-        backward(&mut tape, total_loss_idx);
-
-        // Adam update and Reset
-        let lr_t = learning_rate * (1.0 - step as f64 / num_steps as f64);
-        for (i, &p_idx) in params.iter().enumerate() {
-            let g = tape.grad[p_idx];
-
-            m[i] = beta1 * m[i] + (1.0 - beta1) * g;
-            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
-
-            let m_hat = m[i] / (1.0 - beta1.powi((step + 1) as i32));
-            let v_hat = v[i] / (1.0 - beta2.powi((step + 1) as i32));
-
-            tape.data[p_idx] -= lr_t * m_hat / (v_hat.sqrt() + eps);
+        for pos_id in 0..n {
+            let token_id = tokens[pos_id];
+            let target_id = tokens[pos_id + 1];
+            
+            let mut logits = [0usize; MAX_VOCAB_SIZE];
+            gpt(&mut tape, &mut logits, token_id, pos_id, &mut keys, &mut values, &state_dict);
+            
+            let mut probs = [0usize; MAX_VOCAB_SIZE];
+            tape.softmax(&mut probs, &logits[..vocab_size]);
+            
+            losses[pos_id] = tape.inv_log(probs[target_id]);
         }
 
-        let loss_f64 = tape.data[total_loss_idx];
-        print!("step {:4} | loss {:.4}\r", step + 1, loss_f64);
+        let mut total_losses = losses[0];
+        for i in 1..n {
+            total_losses = tape.add(total_losses, losses[i]);
+        }
+        let loss_idx = tape.mul_const(total_losses, 1.0 / (n as f32));
 
-        // Clear the tape of computation nodes, keep weights
-        tape.truncate(weights_end_idx);
-        tape.zero_grad(); // Reset weights' grads for next step
+        // Backward Pass
+        tape.backward(loss_idx);
+
+        // Adam Optimizer
+        let lr_t = learning_rate * (1.0 - (step as f32 / NUM_STEPS as f32));
+        let beta1_pow = beta1.powi((step + 1) as i32);
+        let beta2_pow = beta2.powi((step + 1) as i32);
+
+        for i in 0..weights_end {
+            let p_grad = tape.grad[i];
+            m[i] = beta1 * m[i] + (1.0 - beta1) * p_grad;
+            v[i] = beta2 * v[i] + (1.0 - beta2) * p_grad * p_grad;
+            
+            let m_hat = m[i] / (1.0 - beta1_pow);
+            let v_hat = v[i] / (1.0 - beta2_pow);
+            
+            tape.data[i] -= lr_t * m_hat / (v_hat.sqrt() + eps_adam);
+        }
+
+        if (step + 1) % 10 == 0 {
+            print!(
+                "Step {} / {} | loss {:.4} | beta1_pow {:.6} | beta2_pow {:.6}\r",
+                step + 1, NUM_STEPS, tape.data[loss_idx], beta1_pow, beta1_pow
+            );
+            use std::io::Write;
+            std::io::stdout().flush()?;
+        }
+
+        // Reset tape for next step, keeping weights
+        tape.truncate(weights_end);
     }
 
-    // -----------------------------
-    // Inference
-    // -----------------------------
-
+    // 6. Inference
+    println!("\n\n-------- inference --------\n");
     let temperature = 0.5;
-    println!("\n--- inference (hallucinated names) ---");
-
-    // Use the watermark from earlier to know where parameters end
-    // let weights_end_idx = tape.nodes.len();
 
     for sample_idx in 0..20 {
-        let mut keys: Vec<Vec<Vec<V>>> = vec![vec![]; n_layer];
-        let mut values: Vec<Vec<Vec<V>>> = vec![vec![]; n_layer];
+        let mut keys: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+        let mut values: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+        let mut token_id = bos_idx;
+        let mut samples = String::new();
 
-        let mut token_id = bos;
-        let mut sample = String::new();
-
-        tape.truncate(weights_end_idx);
-        for pos_id in 0..block_size {
-            let logits = gpt(
-                &mut tape,
-                token_id,
-                pos_id,
-                &mut keys,
-                &mut values,
-                &wte, &wpe, &lm_head,
-                &attn_wq, &attn_wk, &attn_wv, &attn_wo,
-                &mlp_fc1, &mlp_fc2,
-                n_head, head_dim,
-            );
-
-            let temp_val = tape.val(temperature);
-            let scaled: Vec<V> = logits
-                .iter()
-                .map(|&l| div(&mut tape, l, temp_val))
-                .collect();
-
-            let probs = softmax(&mut tape, &scaled);
-
-            let weights: Vec<f64> = probs
-                .iter()
-                .map(|&p| tape.data[p])
-                .collect();
-
-            let mut cumulative = 0.0;
-            let r = rng.uniform();
-            let mut next_token = 0;
-            let total: f64 = weights.iter().sum();
-
-            for (i, w) in weights.iter().enumerate() {
-                cumulative += w / total;
-                if r <= cumulative {
-                    next_token = i;
-                    break;
-                }
+        for pos_id in 0..BLOCK_SIZE {
+            let mut logits_indices = [0usize; MAX_VOCAB_SIZE];
+            gpt(&mut tape, &mut logits_indices, token_id, pos_id, &mut keys, &mut values, &state_dict);
+            
+            // Apply temperature
+            let mut temp_logits = [0usize; MAX_VOCAB_SIZE];
+            for i in 0..vocab_size {
+                temp_logits[i] = tape.mul_const(logits_indices[i], 1.0 / temperature);
             }
 
-            token_id = next_token;
-            if token_id == bos {
+            let mut probs = [0usize; MAX_VOCAB_SIZE];
+            tape.softmax(&mut probs, &temp_logits[..vocab_size]);
+
+            // Convert tape indices to actual weight values for choices
+            let mut weights = [0.0f32; MAX_VOCAB_SIZE];
+            for i in 0..vocab_size {
+                weights[i] = tape.data[probs[i]];
+            }
+
+            token_id = rng.choices(&weights[..vocab_size], 1)[0];
+            if token_id == bos_idx {
                 break;
             }
-            sample.push(uchars[token_id]);
+            samples.push(idx_to_char[token_id]);
         }
-        println!("sample {:2}: {}", sample_idx + 1, sample);
+        
+        println!("{}: {}", sample_idx, samples);
+        tape.truncate(weights_end);
     }
 
+    Ok(())
 }

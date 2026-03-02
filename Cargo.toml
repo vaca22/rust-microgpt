@@ -4,3 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# No external crates are strictly required for the code provided
+
+[profile.release]
+# Optimize for speed (level 3 is the default for release, but explicit here)
+opt-level = 3
+
+# Enable Link Time Optimization to allow optimizations across crate boundaries
+lto = true
+
+# Reduce the number of codegen units to 1 to maximize LTO impact (slower build, faster code)
+codegen-units = 1
+
+# Panic by aborting instead of unwinding to reduce binary size and potentially speed up code
+panic = "abort"
+
+# Enable debug symbols even in release if you want to profile with tools like `perf` or `samply`
+# debug = true
