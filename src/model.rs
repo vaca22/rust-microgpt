@@ -3,9 +3,9 @@ use crate::Matrix;
 use crate::Tape;
 use crate::PythonRandom;
 
-pub const N_LAYER: usize = 1;
-pub const BLOCK_SIZE: usize = 16;
-pub const N_EMBD: usize = 16;
+pub const N_LAYER: usize = 2;      // 从 1 层增加到 2 层
+pub const BLOCK_SIZE: usize = 64;   // 从 16 增加到 64（更长的上下文）
+pub const N_EMBD: usize = 32;       // 从 16 增加到 32（更大的嵌入维度）
 pub const N_HEAD: usize = 4;
 pub const HEAD_DIM: usize = N_EMBD / N_HEAD;
 

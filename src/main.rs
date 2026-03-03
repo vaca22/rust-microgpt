@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::env;
 
-const NUM_STEPS: usize = 1000;
+const NUM_STEPS: usize = 5000;  // 从 1000 增加到 5000，更充分的训练
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize Tape and Random Number Generator

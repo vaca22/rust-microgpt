@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-const INFERENCE_LENGTH: usize = 100;  // 每次生成的最大长度
+const INFERENCE_LENGTH: usize = 200;  // 从 100 增加到 200，生成更长的回复
 
 pub fn run_chat_mode(
     tape: &mut Tape,
@@ -19,8 +19,9 @@ pub fn run_chat_mode(
     weights_end: usize,
     bos_idx: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🤖 小说专家 - 对话模式");
+    println!("\n🤖 小说专家 - 对话模式 (增强版)");
     println!("{}", "=".repeat(50));
+    println!("上下文长度：64 字符 | 生成长度：200 字符");
     println!("输入文字，我会继续生成小说内容");
     println!("输入 'quit' 或 'exit' 退出");
     println!("输入 'clear' 清空对话历史");
@@ -80,9 +81,12 @@ pub fn run_chat_mode(
         // 将生成的内容也加入历史（用于多轮对话）
         conversation_history.push_str(&response);
         
-        // 限制历史长度，避免超出 BLOCK_SIZE
-        if conversation_history.len() > BLOCK_SIZE - 10 {
-            conversation_history = conversation_history.chars().take(BLOCK_SIZE - 10).collect();
+        // 限制历史长度，避免超出 BLOCK_SIZE（现在 64 字符）
+        if conversation_history.len() > BLOCK_SIZE - 20 {
+            // 保留最近的对话
+            conversation_history = conversation_history.chars().skip(
+                conversation_history.chars().count() - (BLOCK_SIZE - 20)
+            ).collect();
         }
     }
     
