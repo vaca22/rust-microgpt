@@ -1,7 +1,7 @@
 use std::f32;
 use std::ptr;
 
-pub const MAX_VOCAB_SIZE: usize = 100;
+pub const MAX_VOCAB_SIZE: usize = 512;
 
 pub type DataT = f32;
 pub type GradT = f32;

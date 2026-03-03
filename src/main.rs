@@ -6,6 +6,7 @@
 pub mod mt19937_rng;
 pub mod tape;
 pub mod model;
+pub mod chat;
 
 use crate::mt19937_rng::PythonRandom;
 use crate::tape::*;
@@ -14,6 +15,7 @@ use crate::model::*;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::env;
 
 const NUM_STEPS: usize = 1000;
 
@@ -148,44 +150,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tape.truncate(weights_end);
     }
 
-    // 6. Inference
-    println!("\n\n-------- inference --------\n");
-    let temperature = 0.5;
+    // 6. Check for chat mode
+    let args: Vec<String> = env::args().collect();
+    let chat_mode = args.iter().any(|arg| arg == "--chat" || arg == "-c");
+    
+    if chat_mode {
+        // Run interactive chat mode
+        chat::run_chat_mode(
+            &mut tape,
+            &mut rng,
+            vocab_size,
+            &idx_to_char,
+            &char_to_idx,
+            &state_dict,
+            weights_end,
+            bos_idx,
+        )?;
+    } else {
+        // Run standard inference (generate 20 samples)
+        println!("\n\n-------- inference --------\n");
+        let temperature = 0.5;
 
-    for sample_idx in 0..20 {
-        let mut keys: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
-        let mut values: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
-        let mut token_id = bos_idx;
-        let mut samples = String::new();
+        for sample_idx in 0..20 {
+            let mut keys: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+            let mut values: KVCache = [[[0; N_EMBD]; BLOCK_SIZE]; N_LAYER];
+            let mut token_id = bos_idx;
+            let mut samples = String::new();
 
-        for pos_id in 0..BLOCK_SIZE {
-            let mut logits_indices = [0usize; MAX_VOCAB_SIZE];
-            gpt(&mut tape, &mut logits_indices, token_id, pos_id, &mut keys, &mut values, &state_dict);
+            for pos_id in 0..BLOCK_SIZE {
+                let mut logits_indices = [0usize; MAX_VOCAB_SIZE];
+                gpt(&mut tape, &mut logits_indices, token_id, pos_id, &mut keys, &mut values, &state_dict);
+                
+                // Apply temperature
+                let mut temp_logits = [0usize; MAX_VOCAB_SIZE];
+                for i in 0..vocab_size {
+                    temp_logits[i] = tape.mul_const(logits_indices[i], 1.0 / temperature);
+                }
+
+                let mut probs = [0usize; MAX_VOCAB_SIZE];
+                tape.softmax(&mut probs, &temp_logits[..vocab_size]);
+
+                // Convert tape indices to actual weight values for choices
+                let mut weights = [0.0f32; MAX_VOCAB_SIZE];
+                for i in 0..vocab_size {
+                    weights[i] = tape.data[probs[i]];
+                }
+
+                token_id = rng.choices(&weights[..vocab_size], 1)[0];
+                if token_id == bos_idx {
+                    break;
+                }
+                samples.push(idx_to_char[token_id]);
+            }
             
-            // Apply temperature
-            let mut temp_logits = [0usize; MAX_VOCAB_SIZE];
-            for i in 0..vocab_size {
-                temp_logits[i] = tape.mul_const(logits_indices[i], 1.0 / temperature);
-            }
-
-            let mut probs = [0usize; MAX_VOCAB_SIZE];
-            tape.softmax(&mut probs, &temp_logits[..vocab_size]);
-
-            // Convert tape indices to actual weight values for choices
-            let mut weights = [0.0f32; MAX_VOCAB_SIZE];
-            for i in 0..vocab_size {
-                weights[i] = tape.data[probs[i]];
-            }
-
-            token_id = rng.choices(&weights[..vocab_size], 1)[0];
-            if token_id == bos_idx {
-                break;
-            }
-            samples.push(idx_to_char[token_id]);
+            println!("{}: {}", sample_idx, samples);
+            tape.truncate(weights_end);
         }
-        
-        println!("{}: {}", sample_idx, samples);
-        tape.truncate(weights_end);
     }
 
     Ok(())
